@@ -127,13 +127,9 @@ class OdooClient:
 
     def _auth_json2(self) -> Optional[int]:
         try:
-            resp = self._http.get(
-                f"{self.url}/api/res.users/whoami",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("uid") or data.get("id")
+            # context_get carries the uid the API key belongs to.
+            data = self._json2_call("res.users", "context_get", {})
+            return data.get("uid") if isinstance(data, dict) else None
         except Exception as exc:
             logger.error("JSON-2 auth failed: %s", exc)
             return None
@@ -155,19 +151,57 @@ class OdooClient:
                   model, method, list(args), kwargs],
         )
 
+    # JSON-2 (POST /json/2/<model>/<method>) takes named arguments only.
+    # Names for the positional arguments this client passes; any other
+    # method is treated as a record method whose one positional is "ids".
+    _JSON2_ARGS: dict[str, tuple[str, ...]] = {
+        "search": ("domain",),
+        "search_read": ("domain",),
+        "search_count": ("domain",),
+        "create": ("vals_list",),
+        "read": ("ids",),
+        "write": ("ids", "vals"),
+        "unlink": ("ids",),
+        "get_views": ("views",),
+    }
+
     def _exec_json2(self, model: str, method: str, *args: Any, **kwargs: Any) -> Any:
-        payload: dict[str, Any] = {}
-        if args:
-            payload["args"] = list(args)
-        if kwargs:
-            payload.update(kwargs)
+        names = self._JSON2_ARGS.get(method, ("ids",))
+        if len(args) > len(names):
+            raise OdooConnectionError(
+                f"JSON-2 takes named arguments only; {model}.{method} got "
+                f"{len(args)} positional, expected at most {len(names)}"
+            )
+        payload: dict[str, Any] = dict(zip(names, args))
+        payload.update(kwargs)
+        # A model-level method (no records) is called without "ids".
+        if method not in self._JSON2_ARGS and not payload.get("ids"):
+            payload.pop("ids", None)
+        # create() with one dict returns one id over JSON-RPC; keep that.
+        single = method == "create" and isinstance(payload.get("vals_list"), dict)
+        if single:
+            payload["vals_list"] = [payload["vals_list"]]
+        result = self._json2_call(model, method, payload)
+        if single and isinstance(result, list):
+            return result[0] if result else False
+        return result
+
+    def _json2_call(self, model: str, method: str, payload: dict[str, Any]) -> Any:
         resp = self._http.post(
-            f"{self.url}/api/{model}/{method}",
+            f"{self.url}/json/2/{model}/{method}",
             json=payload,
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            headers={
+                "Authorization": f"bearer {self.api_key}",
+                "X-Odoo-Database": self.database,
+            },
         )
-        resp.raise_for_status()
-        return resp.json()
+        if resp.is_success:
+            return resp.json()
+        try:
+            msg = resp.json().get("message") or resp.text
+        except ValueError:
+            msg = resp.text
+        raise OdooConnectionError(f"Odoo error ({resp.status_code}): {msg}")
 
     # -- convenience ---------------------------------------------------------
 
@@ -988,6 +1022,7 @@ def odoo_connection_info() -> str:
         "username": odoo.username,
         "version": odoo.version,
         "uid": odoo.uid,
+        "protocol": "json2" if odoo._use_json2 else "jsonrpc",
     })
 
 
